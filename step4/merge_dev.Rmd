@@ -1,0 +1,448 @@
+---
+title: "Merge for CBP extended mutations study"
+output: html_notebook
+---
+```{r}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(zoo)
+```
+
+All files used are either clinical files or output of Tempus/FM exclusive scripts for transforming into CBP compatible files
+
+#Patients/Samples data
+##Create master list of Patient_IDs from clinic data, exclude patients from FM and Tempus that are not in clinic registry
+```{r}
+masterpat=read.csv("~/Metadata.20210829.txt",sep="\t",colClasses="character")
+masterpat=masterpat%>%
+	select(MRN_Hashed)%>%
+	unique()
+```
+
+###Create data_clinical_patients file
+-(Patient data tables)
+```{r}
+#aggregate Patients, row bind all common columns
+FM=read.csv("~/ARMOR/cBioPortal/data_clinical_patient.txt",sep="\t",colClasses = "character")
+tempus=read.csv("~/JSON/cBioPortal/study/data_clinical_patient.txt",sep="\t",colClasses = "character")
+Caris=read.csv("~/Caris/cBioPortal/study/data_clinical_patient.txt",sep="\t",colClasses="character")
+Guardant=read.csv("~/Guardant/cBioPortal/study/data_clinical_patient.txt",sep="\t",colClasses="character")
+clinic=read.csv("~/Clinic-Data/Metadata.20210829.txt",sep="\t",colClasses="character")
+
+merged=rbind.fill(FM,tempus,Caris,Guardant)
+merged[merged==""]=NA
+merged=merged%>%
+	select(PATIENT_ID,OS_STATUS,OS_MONTHS,SEX,RACE,ETHNICITY,AGE,ONCOTREE,Oncotree_Date,METASTATIC,Metastatic_Date)%>%
+	unique()
+```
+
+-(Enriched tables)-Add Oncotree organ, BTTSR specimen type & studyID
+```{r}
+#add BTTSR specimen
+load("~/olivier/Cleaning_Up/out/clean_20210319_1_DI.rda")
+hashed=read.table("~/olivier/Cleaning_Up/out/HashedMRN_04-07-2021.csv",sep=",",header=TRUE)
+
+#create BTTSR columns
+pat=clean_DI0%>%
+	select(studyID,Spec.Type,Spec.Status)%>%
+	group_by(studyID)%>%
+	#Check if studyID has tissue specimens or not
+	mutate(Spec.Type=if_else(grepl("Tissue",Spec.Type)&!grepl("Depleted",Spec.Status),"Tissue","Other"))%>%
+	mutate(BTTSR_SPEC=if_else(any(str_detect(Spec.Type,"Tissue")),"Tissue","Other"))%>%
+	unique()
+
+#add Patient_ID from hashed table to BTTSR table
+BTTSR=pat%>%
+	left_join(hashed,by="studyID")%>%
+	rename(PATIENT_ID=Patient_ID,BTTSR_ID=studyID)%>%
+	select(PATIENT_ID,BTTSR_ID,BTTSR_SPEC)%>%
+	unique()
+```
+
+-Merge patient data tables with enriched tables
+```{r}
+#Create merged table
+merged=merged%>%
+	left_join(BTTSR,by="PATIENT_ID")%>%
+	group_by(PATIENT_ID)%>%
+	mutate(Oncotree_Date=as.Date(Oncotree_Date))%>%
+	arrange(Oncotree_Date)%>%
+	#Fix metastatic
+	mutate(METASTATIC=case_when(
+		any(METASTATIC=="Met")~"Met",
+		TRUE~METASTATIC
+	))%>%
+	select(-Metastatic_Date)%>%
+	#Fix oncotree
+	mutate(ONCOTREE=case_when(
+		Oncotree_Date==min(Oncotree_Date)&!is.na(ONCOTREE)~ONCOTREE,
+		all(is.na(ONCOTREE))~NA_character_,
+		TRUE~NA_character_
+	))%>%
+	fill(ONCOTREE,.direction="downup")%>%
+	mutate(ONCOTREE=case_when(
+		n_distinct(ONCOTREE)>1~"Multiple_Organ",
+		TRUE~ONCOTREE
+	))%>%
+	select(-Oncotree_Date)%>%
+	#Fix Sex
+	mutate(SEX=case_when(
+		n_distinct(SEX)>1~"UNKNOWN",
+		TRUE~SEX
+	))%>%
+	#Fix OS_STATUS
+	mutate(OS_STATUS=case_when(
+		n_distinct(OS_STATUS)>1~"DECEASED",
+		TRUE~OS_STATUS
+	))%>%
+	unique()%>%
+	group_by(PATIENT_ID)%>%
+	add_count()%>%
+	filter(AGE==max(AGE)|is.na(AGE))%>%
+	filter(OS_MONTHS==min(OS_MONTHS)|is.na(OS_MONTHS))
+	#slice(which.max(OS_MONTHS))
+
+```
+
+-Cleanup, select wanted columns
+```{r}
+merged[merged==""]=NA
+
+#Change blanks to Unknown
+merged$RACE[is.na(merged$RACE)]="Unknown"
+merged$ETHNICITY[is.na(merged$ETHNICITY)]="Unknown"
+
+merged$ONCOTREE[is.na(merged$ONCOTREE)]="UNKNOWN"
+
+#Change blank to None
+merged$BTTSR_SPEC[is.na(merged$BTTSR_SPEC)]="None"
+
+#Cap age at 90
+merged$AGE[merged$AGE>=90]=90
+
+#Refill with placeholders
+merged[is.na(merged)]=""
+
+merged=merged%>%
+	select(PATIENT_ID,OS_STATUS,OS_MONTHS,SEX,RACE,ETHNICITY,AGE,ONCOTREE,BTTSR_ID,BTTSR_SPEC)%>%
+	#Remove patients not in clinic data table
+	filter(PATIENT_ID%in%masterpat$MRN_Hashed)%>%
+	unique()
+```
+
+-Write table
+```{r}
+write.table(merged,"~/cBioPortal/merged_extended/data_clinical_patient.txt",sep="\t",quote=FALSE,row.names=FALSE)
+#need to add headers
+```
+
+###Create data_clinical_samples file
+-(Sample data tables)
+```{r}
+#aggregate samples-UCSDP5a8a2d3564d27b19 gets ucsds-27 sample change
+FM=read.csv("~/ARMOR/cBioPortal/data_clinical_sample.txt",sep="\t",colClasses="character")
+tempus=read.csv("~/JSON/cBioPortal/study/data_clinical_samples.txt",sep="\t",colClasses="character")
+Caris=read.csv("~/Caris/cBioPortal/study/data_clinical_sample.txt",sep="\t",colClasses="character")
+Guardant=read.csv("~/Guardant/cBioPortal/study/data_clinical_sample.txt",sep="\t",colClasses="character")
+```
+
+-Merge patient data tables and enriched tables
+```{r}
+merged=rbind.fill(FM,tempus,Caris,Guardant)
+
+merged=merged%>%
+	group_by(SAMPLE_ID)%>%
+	#Fill missing data
+	fill(names(.),.direction="downup")%>%
+	filter(DAYS_TO_REPORT==min(DAYS_TO_REPORT)|is.na(DAYS_TO_REPORT))%>%
+	ungroup()%>%
+	#Change specimen site to BLOOD and OTHER categories
+	mutate(SPECIMEN_TYPE=if_else(grepl("Blood",SPECIMEN_SITE),"Peripheral Blood","Other"))%>%
+	unique()
+```
+
+-Cleanup,select wanted columns
+```{r}
+merged[merged==""]=NA
+merged=merged%>%
+	filter(!is.na(SAMPLE_ID))%>%
+	unique()
+
+#Set blank to 0
+merged$REPORT_YEAR[is.na(merged$REPORT_YEAR)]=0
+
+#Set blank to -1
+merged$DAYS_TO_REPORT[is.na(merged$DAYS_TO_REPORT)]=-1
+
+#Set blank to Unknown
+merged$MICRO_INSTABILITY[is.na(merged$MICRO_INSTABILITY)]="unknown"
+merged$MICRO_INSTABILITY[merged$MICRO_INSTABILITY==""]="unknown"
+
+merged=merged%>%
+	select(PATIENT_ID,SAMPLE_ID,REPORT_YEAR,DAYS_TO_REPORT,CANCER_TYPE,SPECIMEN_SITE,SPECIMEN_TYPE,ASSAY,TMB,TMB_SCORE,MICRO_INSTABILITY,LABORATORY,RNA,LOSS_OF_HETEROZYGOSITY,LOH_PERCENTAGE)%>%
+	#Remove patients not in clinic data
+	filter(PATIENT_ID%in%masterpat$MRN_Hashed)%>%
+	unique()
+
+merged[is.na(merged)]=""
+```
+
+-Write table
+```{r}
+write.table(merged,"~/cBioPortal/merged_extended/data_clinical_sample.txt",sep="\t",quote=FALSE,row.names=FALSE)
+#need to add headers
+```
+
+
+##Create master list of Sample IDs, remove samples that don't belong to patients in clinic registry
+```{r}
+mastersample=merged%>%
+	select(PATIENT_ID,SAMPLE_ID)%>%
+	unique()
+```
+
+#Mutations data
+###Create data_CNA file
+-Merge data tables
+```{r}
+#FM1=read.csv("~/cBioPortal/flat_files_11302020_12312020/UCSD_FM1/data_CNA.txt",sep="\t",stringsAsFactors = FALSE)
+#FM2=read.csv("~/cBioPortal/flat_files_11302020_12312020/UCSD_FM2/data_CNA.txt",sep="\t",stringsAsFactors = FALSE)
+FM=read.csv("~/ARMOR/cBioPortal/data_CNA.txt",sep="\t",colClasses="character")
+Tempus=read.csv("~/JSON/cBioPortal/mutations/data_CNA.txt",sep="\t",colClasses="character")
+Caris=read.csv("~/Caris/cBioPortal/mutations/data_CNA.txt",sep="\t",colClasses="character")
+Guardant=read.csv("~/Guardant/cBioPortal/mutations/data_CNA.txt",sep="\t",colClasses="character")
+merged=rbind.fill(FM,Tempus,Caris,Guardant)
+```
+
+-Select samples that are in master samples list
+```{r}
+merged=merged%>%
+	select(Hugo_Symbol,Entrez_Gene_Id,contains(mastersample$SAMPLE_ID))%>%
+	unique()
+```
+
+-Fill blanks correctly if patients have different genes sequenced or multiple report
+```{r}
+#Remove 0s in case of observation in two rows of identical genes  ## OH the goal of this section is not clear SP: Some samples have duplicate rows with different observations, fill 0s with correct CNA observation --ex: one sample column (UCSDS) with two rows of same gene (TP53) with different observations for the same gene (0 and 1) probably due to sequencing type, replace the 0 with 1
+
+#Replace 0 with NA for fill
+merged[merged==0]=NA
+
+#Fill observation
+merged=merged%>%
+	unique()%>%
+	group_by(Hugo_Symbol,Entrez_Gene_Id)%>%
+	mutate_if(~n_distinct(.)>1,list(~ na.locf(.,na.rm=FALSE)))%>%
+	mutate_if(~n_distinct(.)>1,list(~ na.locf(.,na.rm=FALSE,fromLast=TRUE)))%>%
+	unique()
+
+merged=merged%>%
+	filter(!is.na(Hugo_Symbol))
+
+#Replace NAs with 0
+merged[is.na(merged)]="0"
+```
+
+Write table
+```{r}
+write.table(merged,"~/cBioPortal/merged_extended/data_CNA.txt",sep="\t",quote=FALSE,row.names = FALSE)
+```
+
+###Create data_fusions file
+```{r}
+#Fusions-remove annotation column from FM
+#FM=read.csv("~/ARMOR/cBioPortal/data_clinical_fusions.txt",sep="\t",colClasses = "character")
+#FM2=read.csv("~/cBioPortal/flat_files_11302020_12312020/UCSD_FM2/data_fusions.txt",sep="\t",stringsAsFactors = #FALSE,colClasses = "character")
+#Tempus=read.csv("~/JSON/cBioPortal/mutations/data_fusions.txt",sep="\t",stringsAsFactors = FALSE,colClasses = "character")
+#Caris=read.csv("~/Caris/cBioPortal/mutations/data_fusions.txt",sep="\t",colClasses = "character")
+#Guardant=read.csv("~/Guardant/cBioPortal/mutations/data_fusions.txt",sep="\t",colClasses="character")
+
+#assay=read.csv("~/ARMOR/flat_files_20210319/merged/data_clinical_patient.txt",sep="\t",colClasses = "character")
+#assay=assay%>%
+#	select(SAMPLE_ID,PLATFORM)%>%
+#	rename(Tumor_Sample_Barcode=SAMPLE_ID,Method=PLATFORM)%>%
+#	unique()
+
+#FM=FM%>%
+#	select(-Annotation,-Method)%>%
+#	left_join(assay,by="Tumor_Sample_Barcode")%>%
+#	unique()
+
+#merged=rbind(FM,Tempus,Caris,Guardant)
+
+#merged=merged%>%
+	#Remove samples not in master sample list
+#	filter(Tumor_Sample_Barcode%in%mastersample$SAMPLE_ID)%>%
+#	select(Hugo_Symbol,Entrez_Gene_Id,Center,Tumor_Sample_Barcode,Fusion,DNA_support,RNA_support,Method,Frame)%>%
+#	mutate(Entrez_Gene_Id=as.integer(Entrez_Gene_Id))%>%
+#	unique()
+
+#write.table(merged,"~/cBioPortal/merged_extended/data_fusions.txt",sep="\t",quote=FALSE,row.names = FALSE)
+```
+
+workaround for missing ARMOR files
+```{r}
+cbp=read.csv("~/cBioPortal/old/data_fusions.txt",sep="\t",colClasses="character")
+Tempus=read.csv("~/JSON/cBioPortal/mutations/data_fusions.txt",sep="\t",colClasses="character")
+Caris=read.csv("~/Caris/cBioPortal/mutations/data_fusions.txt",sep="\t",colClasses = "character")
+Guardant=read.csv("~/Guardant/cBioPortal/mutations/data_fusions.txt",sep="\t",colClasses="character")
+
+merged=rbind.fill(cbp,Caris,Guardant)
+merged=merged%>%
+	filter(Tumor_Sample_Barcode%in%mastersample$SAMPLE_ID)%>%
+	unique()
+
+write.table(merged,"~/cBioPortal/merged_extended/data_fusions.txt",sep="\t",quote=FALSE,row.names = FALSE)
+
+```
+
+
+###Create data_mutations_extended file
+```{r}
+FM=read.csv("~/ARMOR/cBioPortal/data_mutations_extended.txt",sep="\t",colClasses = "character")
+Tempus=read.csv("~/JSON/cBioPortal/mutations/data_mutations_extended.txt",sep="\t",colClasses="character")
+Caris=read.csv("~/Caris/cBioPortal/mutations/data_mutations_extended.txt",sep="\t",colClasses = "character")
+Guardant=read.csv("~/Guardant/cBioPortal/mutations/data_mutations_extended.txt",sep="\t",colClasses="character"
+									)
+merged=rbind.fill(FM,Tempus,Caris,Guardant)
+
+merged[merged==""]=NA
+merged$NCBI_Build[merged$NCBI_Build=="37"]="GRCh37"
+
+merged=merged%>%
+	#Remove samples without NCBI build  
+	filter(!is.na(NCBI_Build))%>%
+	#Add unknown to variant type
+	mutate(Variant_Type=if_else(is.na(Variant_Type),"UNK",Variant_Type))%>%
+	#Fill in unknown to variant classification
+	mutate(Variant_Classification=if_else(is.na(Variant_Classification),"Unknown",Variant_Classification))%>%
+	mutate(HGVSp_Short=if_else(grepl("\\+",HGVSp_Short),"NA_splice",HGVSp_Short))%>%
+	#Remove samples not in master sample list
+	filter(Tumor_Sample_Barcode%in%mastersample$SAMPLE_ID)%>%
+	unique()
+
+merged[is.na(merged)]=""
+
+write.table(merged,"~/cBioPortal/merged_extended/data_mutations_extended.txt",sep="\t",quote=FALSE,row.names = FALSE)
+```
+
+#Case List data
+```{r}
+samples=read.csv("~/cBioPortal/merged_extended/data_clinical_sample.txt",sep="\t",colClasses="character")
+#add skip=4 if headers already included
+
+samples=samples%>%
+	select(SAMPLE_ID)%>%
+	unique()
+
+samples=t(samples)
+
+write.table(samples,"~/cBioPortal/merged_extended/case_lists/cases_cna.txt",sep="\t",quote=FALSE,row.names=FALSE,col.names=FALSE)
+write.table(samples,"~/cBioPortal/merged_extended/case_lists/cases_cnaseq.txt",sep="\t",quote=FALSE,row.names=FALSE,col.names=FALSE)
+write.table(samples,"~/cBioPortal/merged_extended/case_lists/cases_sequenced.txt",sep="\t",quote=FALSE,row.names=FALSE,col.names=FALSE)
+#need to add headers
+
+```
+
+#Timeline data
+```{r}
+patients=read.csv("~/cBioPortal/merged_extended/data_clinical_patient.txt",sep="\t",colClasses="character")
+samples=read.csv("~/cBioPortal/merged_extended/data_clinical_sample.txt",sep="\t",colClasses="character")
+metadata=read.csv("~/Metadata.20210319.txt",sep="\t",colClasses="character")
+meds=read.csv("~/Rishaan_meds/hashed_drug_holiday_v4.txt",sep="\t",colClasses="character")
+
+metadata[metadata==""]=NA
+
+#Oncotree diagnosis
+diagnosis=metadata%>%
+	select(Patient_ID,Anchor_Date,Oncotree.level.1,Oncotree_Date)%>%
+	mutate(Anchor_Date=as.Date(Anchor_Date),Oncotree_Date=as.Date(Oncotree_Date))%>%
+	rename(PATIENT_ID=Patient_ID,DIAGNOSIS=Oncotree.level.1)%>%
+	#Start Date
+	mutate(START_DATE=as.numeric(Oncotree_Date-Anchor_Date))%>%
+	select(-Anchor_Date,-Oncotree_Date)%>%
+	#Stop Date
+	mutate(STOP_DATE="")%>%
+	#Event type
+	mutate(EVENT_TYPE="DIAGNOSIS")%>%
+	filter(!is.na(PATIENT_ID))%>%
+	filter(!is.na(START_DATE))%>%
+	filter(PATIENT_ID%in%patients$PATIENT_ID)%>%
+	select(PATIENT_ID,START_DATE,STOP_DATE,EVENT_TYPE,DIAGNOSIS)%>%
+	unique()
+	
+diagnosis[is.na(diagnosis)]=""
+
+write.table(diagnosis,"~/cBioPortal/merged_extended/data_timeline_diagnosis.txt",sep="\t",quote=FALSE,row.names=FALSE)
+
+#Metastatic
+metastatic=metadata%>%
+	select(Patient_ID,Anchor_Date,Metastatic,Metastatic_Date)%>%
+	mutate(Anchor_Date=as.Date(Anchor_Date),Metastatic_Date=as.Date(Metastatic_Date))%>%
+	rename(PATIENT_ID=Patient_ID,METASTATIC=Metastatic)%>%
+	#Start Date
+	mutate(START_DATE=as.numeric(Metastatic_Date-Anchor_Date))%>%
+	select(-Anchor_Date,-Metastatic_Date)%>%
+	#Stop Date
+	mutate(STOP_DATE="")%>%
+	#Event type
+	mutate(EVENT_TYPE="METASTATIC")%>%
+	filter(!is.na(PATIENT_ID))%>%
+	filter(!is.na(START_DATE))%>%
+	filter(PATIENT_ID%in%patients$PATIENT_ID)%>%
+	select(PATIENT_ID,START_DATE,STOP_DATE,EVENT_TYPE,METASTATIC)%>%
+	unique()
+
+metastatic[is.na(metastatic)]=""
+
+write.table(metastatic,"~/cBioPortal/merged_extended/data_timeline_metastatic.txt",sep="\t",row.names=FALSE,quote=FALSE)
+
+#Samples
+specimen=samples%>%
+	select(PATIENT_ID,SAMPLE_ID,DAYS_TO_REPORT,SPECIMEN_SITE,SPECIMEN_TYPE,LABORATORY)%>%
+	rename(SPECIMEN_REFERENCE_NUMBER=SAMPLE_ID,SOURCE=LABORATORY,START_DATE=DAYS_TO_REPORT)%>%
+	#Start Date
+	mutate(START_DATE=as.numeric(START_DATE))%>%
+	mutate(START_DATE=if_else(is.na(START_DATE),0,START_DATE))%>%
+	#Specimen Type
+	mutate(SPECIMEN_TYPE=if_else(grepl("blood",SPECIMEN_TYPE),"Blood","Tissue"))%>%
+	#Stop Date
+	mutate(STOP_DATE="")%>%
+	#Event type
+	mutate(EVENT_TYPE="SPECIMEN")%>%
+	filter(!is.na(PATIENT_ID))%>%
+	filter(!is.na(START_DATE))%>%
+	filter(PATIENT_ID%in%patients$PATIENT_ID)%>%
+	filter(!is.na(SPECIMEN_REFERENCE_NUMBER))%>%
+	filter(SPECIMEN_REFERENCE_NUMBER%in%samples$SAMPLE_ID)%>%
+	select(PATIENT_ID,START_DATE,STOP_DATE,EVENT_TYPE,SPECIMEN_REFERENCE_NUMBER,SPECIMEN_SITE,SPECIMEN_TYPE,SOURCE)%>%
+	unique()
+
+specimen[is.na(specimen)]=""
+
+write.table(specimen,"~/cBioPortal/merged_extended/data_timeline_sample.txt",sep="\t",row.names=FALSE,quote=FALSE)
+
+#Medications
+medications=meds%>%
+	mutate(EVENT_TYPE="TREATMENT",TREATMENT_TYPE="Medical Therapy",INGREDIENT=str_to_title(ingredient_name))%>%
+	rename(START_DATE=start,STOP_DATE=stop,PATIENT_ID=Patient_ID)%>%
+	filter(!is.na(START_DATE))%>%
+	select(PATIENT_ID,START_DATE,STOP_DATE,EVENT_TYPE,TREATMENT_TYPE,INGREDIENT)%>%
+	unique()
+	
+medications[is.na(medications)]=""
+
+write.table(medications,"~/cBioPortal/merged_extended/data_timeline_medications.txt",sep="\t",row.names=FALSE,quote=FALSE)
+	
+
+```
+
+
+
+
+
+
+

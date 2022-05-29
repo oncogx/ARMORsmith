@@ -1,0 +1,7 @@
+Tempus process to generate MRNs for CTRI
+*note: may have to change some column names in TempusCleaning.R to clean/harmonize schemas
+1. Pull raw JSON from Tempus
+2. Remove IHC reports; run ihcSorter.R
+3. Parse reports; run TempusParser.R
+4. Aggregate parsed reports; run aggMutations.R, aggPatients.R
+5. Clean/harmonize different schema versions; run TempusCleaning.R
